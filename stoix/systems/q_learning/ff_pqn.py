@@ -78,8 +78,8 @@ def get_learner_fn(
             # LOG EPISODE METRICS
             done = timestep.last().reshape(-1)
             info = {**timestep.extras["episode_metrics"]}
-            info["epsilon"] = epsilon.repeat(done.shape[0])
-            info["update_no"] = update_no.repeat(done.shape[0])
+            info["epsilon"] = jnp.full(done.shape, epsilon, dtype=jnp.float32)
+            info["update_no"] = jnp.full(done.shape, update_no, dtype=jnp.int32)
             next_obs = timestep.extras["next_obs"]
 
             transition = Transition(

@@ -314,14 +314,26 @@ def learner_setup(
     apply_fns = q_network_apply_fn
     update_fns = q_optim.update
 
+    # Initialise environment states and timesteps early so the replay buffer info tree
+    # matches the real JaxARC episode-metrics structure.
+    key, *env_keys = jax.random.split(
+        key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
+    )
+    env_states, timesteps = env.reset(jnp.stack(env_keys))
+
+    sample_episode_metrics = jax.tree_util.tree_map(
+        lambda x: x[0], timesteps.extras["episode_metrics"]
+    )
+    sample_obs = jax.tree_util.tree_map(lambda x: x[0], timesteps.observation)
+
     # Create replay buffer
     dummy_transition = Transition(
-        obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
+        obs=sample_obs,
         action=jnp.zeros((), dtype=int),
         reward=jnp.zeros((), dtype=float),
         done=jnp.zeros((), dtype=bool),
-        next_obs=jax.tree_util.tree_map(lambda x: x.squeeze(0), init_x),
-        info={"episode_return": 0.0, "episode_length": 0, "is_terminal_step": False},
+        next_obs=sample_obs,
+        info=sample_episode_metrics,
     )
 
     assert config.system.total_buffer_size % n_devices == 0, (
@@ -355,11 +367,6 @@ def learner_setup(
     warmup = get_warmup_fn(env, params, q_network_apply_fn, buffer_fn.add, config)
     warmup = jax.pmap(warmup, axis_name="device")
 
-    # Initialise environment states and timesteps: across devices and batches.
-    key, *env_keys = jax.random.split(
-        key, n_devices * config.arch.update_batch_size * config.arch.num_envs + 1
-    )
-    env_states, timesteps = env.reset(jnp.stack(env_keys))
     reshape_states = lambda x: x.reshape(
         (n_devices, config.arch.update_batch_size, config.arch.num_envs) + x.shape[1:]
     )
