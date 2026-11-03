@@ -9,7 +9,7 @@ action:
   mode: point  # point | bbox | mask
 
 observation_wrappers:
-  answer_grid: true
+  answer_grid: false
   input_grid: true
   contextual: true
 
