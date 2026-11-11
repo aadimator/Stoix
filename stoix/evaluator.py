@@ -154,6 +154,8 @@ def get_ff_evaluator_fn(
         eval_metrics = {
             "episode_return": final_state.episode_return,
             "episode_length": final_state.step_count,
+            # Per-episode outcomes the env reports at the last step, if any.
+            **final_state.timestep.extras.get("eval_metrics", {}),
         }
         # Log solved episode if solve rate is required.
         if log_solve_rate:
@@ -281,6 +283,8 @@ def get_rnn_evaluator_fn(
         eval_metrics = {
             "episode_return": final_state.episode_return,
             "episode_length": final_state.step_count,
+            # Per-episode outcomes the env reports at the last step, if any.
+            **final_state.timestep.extras.get("eval_metrics", {}),
         }
         # Log solved episode if solve rate is required.
         if log_solve_rate:
