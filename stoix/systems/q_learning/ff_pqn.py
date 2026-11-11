@@ -1,6 +1,6 @@
 import copy
 import time
-from typing import Any, Tuple
+from typing import Any, Dict, NamedTuple, Tuple
 
 import chex
 import flax
@@ -23,7 +23,6 @@ from stoix.base_types import (
 )
 from stoix.evaluator import evaluator_setup, get_distribution_act_fn
 from stoix.networks.base import FeedForwardActor as Actor
-from stoix.systems.q_learning.dqn_types import Transition
 from stoix.utils import make_env as environments
 from stoix.utils.checkpointing import Checkpointer
 from stoix.utils.jax_utils import (
@@ -37,6 +36,40 @@ from stoix.utils.total_timestep_checker import check_total_timesteps
 from stoix.utils.training import make_learning_rate
 
 # IMPORTANT: Remember to run PQN with layernorm turned on in the network config file.
+
+
+class Transition(NamedTuple):
+    obs: chex.ArrayTree
+    action: chex.Array
+    reward: chex.Array
+    terminated: chex.Array
+    truncated: chex.Array
+    next_obs: chex.ArrayTree
+    info: Dict
+
+
+def compute_q_lambda_targets(
+    r_t: chex.Array,
+    q_next: chex.Array,
+    terminated: chex.Array,
+    truncated: chex.Array,
+    gamma: float,
+    q_lambda: float,
+) -> chex.Array:
+    """Q(lambda) targets that bootstrap through truncation.
+
+    q_next is Q at each step's true next observation, before any auto-reset.
+    A termination stops the bootstrap; any episode end cuts the lambda trace,
+    so a target never mixes in returns from the next episode.
+    """
+    discount = gamma * (1.0 - terminated)
+    lambda_ = q_lambda * (1.0 - jnp.maximum(terminated, truncated))
+    # Time-major, since batch_lambda_returns doesn't swap the axes of a per-step lambda.
+    r_t, discount, q_next, lambda_ = (
+        jnp.swapaxes(x, 0, 1) for x in (r_t, discount, q_next, lambda_)
+    )
+    targets = batch_q_lambda(r_t, discount, q_next, lambda_, time_major=True)
+    return jnp.swapaxes(targets, 0, 1)
 
 
 def get_learner_fn(
@@ -77,13 +110,22 @@ def get_learner_fn(
 
             # LOG EPISODE METRICS
             done = timestep.last().reshape(-1)
+            # Only a real termination has discount 0; a time limit keeps it.
+            terminated = (timestep.last() & (timestep.discount == 0.0)).reshape(-1)
+            truncated = done & ~terminated
             info = {**timestep.extras["episode_metrics"]}
             info["epsilon"] = jnp.full(done.shape, epsilon, dtype=jnp.float32)
             info["update_no"] = jnp.full(done.shape, update_no, dtype=jnp.int32)
             next_obs = timestep.extras["next_obs"]
 
             transition = Transition(
-                last_timestep.observation, action, timestep.reward, done, next_obs, info
+                last_timestep.observation,
+                action,
+                timestep.reward,
+                terminated.astype(jnp.float32),
+                truncated.astype(jnp.float32),
+                next_obs,
+                info,
             )
 
             learner_state = OnPolicyLearnerState(params, opt_states, key, env_state, timestep)
@@ -96,27 +138,18 @@ def get_learner_fn(
 
         # Swap the batch and time axes to make the batch the leading dimension.
         traj_batch = jax.tree_util.tree_map(lambda x: x.swapaxes(0, 1), traj_batch)
-        # Concatenate the observations and the final next observation of the
-        # trajectory on the time axis.
-        obs_sequence = traj_batch.obs
-        last_obs = jax.tree.map(lambda x: x[:, -1][:, jnp.newaxis], traj_batch.next_obs)
-        observations = jax.tree_util.tree_map(
-            lambda x, y: jnp.concatenate([x, y], axis=1), obs_sequence, last_obs
-        )
-
         # CALCULATE Q LAMBDA TARGETS
         params, opt_states, key, env_state, last_timestep = learner_state
-        # Get all q values in the sequence except the first one
-        q_t = q_apply_fn(params, observations).preferences[:, 1:]
-        r_t = traj_batch.reward
-        d_t = 1.0 - traj_batch.done.astype(jnp.float32)
-        d_t = (d_t * config.system.gamma).astype(jnp.float32)
-        q_targets = batch_q_lambda(
-            r_t,
-            d_t,
+        # Q at each step's true next observation, so a truncated step can
+        # bootstrap from its final observation rather than the reset one.
+        q_t = q_apply_fn(params, traj_batch.next_obs).preferences
+        q_targets = compute_q_lambda_targets(
+            traj_batch.reward,
             q_t,
+            traj_batch.terminated,
+            traj_batch.truncated,
+            config.system.gamma,
             config.system.q_lambda,
-            time_major=False,
         )
 
         def _update_epoch(update_state: Tuple, _: Any) -> Tuple:
